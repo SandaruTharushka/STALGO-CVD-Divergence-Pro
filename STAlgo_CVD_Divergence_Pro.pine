@@ -1,0 +1,195 @@
+//@version=6
+indicator("STAlgo CVD Divergence Pro v1.0", shorttitle="STAlgo CVD DIV", overlay=false, max_lines_count=500, max_labels_count=500)
+
+// CVD from TradingView's official TA library.
+import TradingView/ta/14 as tvta
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+string G_CVD = "01 — CVD Data"
+string ltf       = input.timeframe("1", "Intrabar timeframe", group=G_CVD, tooltip="Use 1-minute data for a 5m chart. For a 1m chart, use 10S or 1S if available on your plan; 1m also works but is coarser.")
+string anchorTF  = input.timeframe("1D", "CVD reset period", group=G_CVD, tooltip="Daily, weekly, or another timeframe STRICTLY higher than the chart timeframe.")
+bool   showLine  = input.bool(true, "CVD line", group=G_CVD)
+bool   showCandle= input.bool(false, "CVD candles", group=G_CVD)
+
+string G_PIV = "02 — Swing Detection"
+int leftBars    = input.int(3, "Pivot left bars", minval=1, maxval=30, group=G_PIV)
+int rightBars   = input.int(3, "Pivot right bars", minval=1, maxval=30, group=G_PIV, tooltip="Signals confirm after this many completed bars. They are drawn at the pivot bar, not when first known.")
+int minBars     = input.int(5, "Min bars between pivots", minval=1, maxval=200, group=G_PIV)
+int maxBars     = input.int(80, "Max bars between pivots", minval=2, maxval=500, group=G_PIV)
+
+string G_FILTER = "03 — Signal Filters"
+bool  showRegular  = input.bool(true, "Regular divergence", group=G_FILTER)
+bool  showHidden   = input.bool(false, "Hidden divergence", group=G_FILTER)
+int   minTicks     = input.int(2, "Minimum price difference (ticks)", minval=0, maxval=500, group=G_FILTER)
+float minATR       = input.float(0.0, "Minimum price difference (ATR multiples)", minval=0.0, maxval=10.0, step=0.05, group=G_FILTER)
+float minCvdDelta  = input.float(0.0, "Minimum CVD difference (x average bar delta)", minval=0.0, maxval=20.0, step=0.1, group=G_FILTER)
+bool  useTrend     = input.bool(false, "EMA trend filter (hidden divergences only)", group=G_FILTER)
+int   emaLength    = input.int(50, "Trend EMA length", minval=2, maxval=500, group=G_FILTER)
+
+string G_UI = "04 — Appearance"
+bool priceLines  = input.bool(true, "Draw divergence on price chart", group=G_UI)
+bool cvdLines    = input.bool(true, "Draw divergence on CVD", group=G_UI)
+bool priceLabels = input.bool(true, "Price-chart signal labels", group=G_UI)
+bool cvdLabels   = input.bool(false, "CVD-pane signal labels", group=G_UI)
+bool dashboard   = input.bool(true, "Show status dashboard", group=G_UI)
+color bullColor  = input.color(color.rgb(22, 181, 114), "Regular bullish", group=G_UI)
+color bearColor  = input.color(color.rgb(235, 73, 87), "Regular bearish", group=G_UI)
+color hBullColor = input.color(color.rgb(27, 160, 187), "Hidden bullish", group=G_UI)
+color hBearColor = input.color(color.rgb(247, 161, 71), "Hidden bearish", group=G_UI)
+
+// Input validation (the library requires LTF <= chart and anchor > chart).
+if barstate.isfirst
+    if not na(timeframe.in_seconds(ltf)) and not na(timeframe.in_seconds(timeframe.period)) and timeframe.in_seconds(ltf) > timeframe.in_seconds(timeframe.period)
+        runtime.error("Intrabar timeframe must be <= chart timeframe. Try 1m on a 5m chart.")
+    if not na(timeframe.in_seconds(anchorTF)) and not na(timeframe.in_seconds(timeframe.period)) and timeframe.in_seconds(anchorTF) <= timeframe.in_seconds(timeframe.period)
+        runtime.error("CVD reset period must be higher than chart timeframe. Try 1D on an intraday chart.")
+    if maxBars <= minBars
+        runtime.error("Max bars between pivots must be greater than Min bars between pivots.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CVD SERIES: lower-timeframe estimate, accumulated within reset period.
+// Values are NOT guaranteed to be exchange-classified aggressor buy/sell volume.
+// ─────────────────────────────────────────────────────────────────────────────
+[cvdOpen, cvdHigh, cvdLow, cvdClose] = tvta.requestVolumeDelta(ltf, anchorTF)
+bool newAnchor = timeframe.change(anchorTF)
+float deltaBar = cvdClose - cvdOpen
+float avgAbsDelta = ta.sma(math.abs(deltaBar), 20)
+float atr = ta.atr(14)
+float priceEMA = ta.ema(close, emaLength)
+bool validCvd = not na(cvdClose)
+
+color cvdColor = cvdClose >= cvdOpen ? color.aqua : color.orange
+plot(showLine ? (newAnchor ? na : cvdClose) : na, title="CVD Close", color=cvdColor, linewidth=2, style=plot.style_linebr)
+plotcandle(showCandle ? cvdOpen : na, showCandle ? cvdHigh : na, showCandle ? cvdLow : na, showCandle ? cvdClose : na, title="CVD Candles", color=cvdClose >= cvdOpen ? color.new(bullColor, 30) : color.new(bearColor, 30), wickcolor=color.gray, bordercolor=cvdClose >= cvdOpen ? bullColor : bearColor)
+hline(0, title="CVD Zero", color=color.new(color.gray, 65), linestyle=hline.style_dotted)
+
+// Swing pivots belong to PRICE. The CVD is sampled at those exact pivot bars.
+// This synchronizes the comparisons; it does NOT claim independent CVD pivots.
+float pricePL = ta.pivotlow(low, leftBars, rightBars)
+float pricePH = ta.pivothigh(high, leftBars, rightBars)
+int pBar = bar_index - rightBars
+int pAnchor = time(anchorTF)[rightBars]
+float pCvd = cvdClose[rightBars]
+
+// Each side compares successive confirmed price pivots within the same CVD anchor.
+var float previousLowPrice = na
+var float previousLowCvd = na
+var int previousLowBar = na
+var int previousLowAnchor = na
+var float previousHighPrice = na
+var float previousHighCvd = na
+var int previousHighBar = na
+var int previousHighAnchor = na
+
+var string lastSignal = "None"
+var int lastConfirmedBar = na
+
+bool regularBull = false
+bool regularBear = false
+bool hiddenBull = false
+bool hiddenBear = false
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LOW-SIDE DIVERGENCES
+// Regular bullish: PRICE lower low, CVD higher at the second PRICE low.
+// Hidden bullish: PRICE higher low, CVD lower (optional EMA-trend filter).
+// ─────────────────────────────────────────────────────────────────────────────
+if barstate.isconfirmed and not na(pricePL) and not na(pCvd) and not na(pAnchor)
+    if not na(previousLowPrice) and not na(previousLowCvd) and pAnchor == previousLowAnchor
+        int gap = pBar - previousLowBar
+        bool gapOK = gap >= minBars and gap <= maxBars
+        float neededPriceMove = math.max(minTicks * syminfo.mintick, minATR * nz(atr[rightBars], 0.0))
+        float neededCvdMove = minCvdDelta * nz(avgAbsDelta[rightBars], 0.0)
+        bool priceMoveOK = math.abs(pricePL - previousLowPrice) >= neededPriceMove
+        bool cvdMoveOK = math.abs(pCvd - previousLowCvd) >= neededCvdMove
+        bool trendBullOK = not useTrend or close[rightBars] > priceEMA[rightBars]
+        bool eligible = gapOK and priceMoveOK and cvdMoveOK
+
+        regularBull := eligible and showRegular and pricePL < previousLowPrice and pCvd > previousLowCvd
+        hiddenBull := eligible and showHidden and trendBullOK and pricePL > previousLowPrice and pCvd < previousLowCvd
+
+        if regularBull or hiddenBull
+            bool isRegular = regularBull
+            color signalColor = isRegular ? bullColor : hBullColor
+            string signalName = isRegular ? "REG BULL" : "HID BULL"
+            if priceLines
+                line.new(previousLowBar, previousLowPrice, pBar, pricePL, xloc=xloc.bar_index, color=signalColor, width=2, style=isRegular ? line.style_solid : line.style_dashed, force_overlay=true)
+            if cvdLines
+                line.new(previousLowBar, previousLowCvd, pBar, pCvd, xloc=xloc.bar_index, color=signalColor, width=2, style=isRegular ? line.style_solid : line.style_dashed)
+            if priceLabels
+                label.new(pBar, pricePL, signalName, xloc=xloc.bar_index, style=label.style_label_up, color=signalColor, textcolor=color.white, size=size.tiny, force_overlay=true)
+            if cvdLabels
+                label.new(pBar, pCvd, signalName, xloc=xloc.bar_index, style=label.style_label_up, color=signalColor, textcolor=color.white, size=size.tiny)
+            lastSignal := signalName
+            lastConfirmedBar := bar_index
+
+    // Store even if no divergence was accepted. No repeated pairing with old lows.
+    previousLowPrice := pricePL
+    previousLowCvd := pCvd
+    previousLowBar := pBar
+    previousLowAnchor := pAnchor
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HIGH-SIDE DIVERGENCES
+// Regular bearish: PRICE higher high, CVD lower at the second PRICE high.
+// Hidden bearish: PRICE lower high, CVD higher (optional EMA-trend filter).
+// ─────────────────────────────────────────────────────────────────────────────
+if barstate.isconfirmed and not na(pricePH) and not na(pCvd) and not na(pAnchor)
+    if not na(previousHighPrice) and not na(previousHighCvd) and pAnchor == previousHighAnchor
+        int gap = pBar - previousHighBar
+        bool gapOK = gap >= minBars and gap <= maxBars
+        float neededPriceMove = math.max(minTicks * syminfo.mintick, minATR * nz(atr[rightBars], 0.0))
+        float neededCvdMove = minCvdDelta * nz(avgAbsDelta[rightBars], 0.0)
+        bool priceMoveOK = math.abs(pricePH - previousHighPrice) >= neededPriceMove
+        bool cvdMoveOK = math.abs(pCvd - previousHighCvd) >= neededCvdMove
+        bool trendBearOK = not useTrend or close[rightBars] < priceEMA[rightBars]
+        bool eligible = gapOK and priceMoveOK and cvdMoveOK
+
+        regularBear := eligible and showRegular and pricePH > previousHighPrice and pCvd < previousHighCvd
+        hiddenBear := eligible and showHidden and trendBearOK and pricePH < previousHighPrice and pCvd > previousHighCvd
+
+        if regularBear or hiddenBear
+            bool isRegular = regularBear
+            color signalColor = isRegular ? bearColor : hBearColor
+            string signalName = isRegular ? "REG BEAR" : "HID BEAR"
+            if priceLines
+                line.new(previousHighBar, previousHighPrice, pBar, pricePH, xloc=xloc.bar_index, color=signalColor, width=2, style=isRegular ? line.style_solid : line.style_dashed, force_overlay=true)
+            if cvdLines
+                line.new(previousHighBar, previousHighCvd, pBar, pCvd, xloc=xloc.bar_index, color=signalColor, width=2, style=isRegular ? line.style_solid : line.style_dashed)
+            if priceLabels
+                label.new(pBar, pricePH, signalName, xloc=xloc.bar_index, style=label.style_label_down, color=signalColor, textcolor=color.white, size=size.tiny, force_overlay=true)
+            if cvdLabels
+                label.new(pBar, pCvd, signalName, xloc=xloc.bar_index, style=label.style_label_down, color=signalColor, textcolor=color.white, size=size.tiny)
+            lastSignal := signalName
+            lastConfirmedBar := bar_index
+
+    previousHighPrice := pricePH
+    previousHighCvd := pCvd
+    previousHighBar := pBar
+    previousHighAnchor := pAnchor
+
+// Alerts only pulse on the confirmation bar close (rightBars AFTER pivot bar).
+alertcondition(regularBull, title="Regular Bullish CVD Divergence", message="STAlgo regular bullish CVD divergence | {{ticker}} | {{interval}} | Confirmed pivot")
+alertcondition(regularBear, title="Regular Bearish CVD Divergence", message="STAlgo regular bearish CVD divergence | {{ticker}} | {{interval}} | Confirmed pivot")
+alertcondition(hiddenBull, title="Hidden Bullish CVD Divergence", message="STAlgo hidden bullish CVD divergence | {{ticker}} | {{interval}} | Confirmed pivot")
+alertcondition(hiddenBear, title="Hidden Bearish CVD Divergence", message="STAlgo hidden bearish CVD divergence | {{ticker}} | {{interval}} | Confirmed pivot")
+alertcondition(regularBull or hiddenBull, title="Any Bullish CVD Divergence", message="STAlgo bullish CVD divergence | {{ticker}} | {{interval}}")
+alertcondition(regularBear or hiddenBear, title="Any Bearish CVD Divergence", message="STAlgo bearish CVD divergence | {{ticker}} | {{interval}}")
+
+// Compact status dashboard. The CVD number is an estimate, not exact trade delta.
+var table dash = table.new(position.top_right, 2, 5, border_width=1)
+if barstate.islast and dashboard
+    color panel = color.rgb(23, 28, 38)
+    color muted = color.rgb(165, 176, 192)
+    table.cell(dash, 0, 0, "STAlgo", text_color=color.white, bgcolor=color.rgb(38, 56, 77))
+    table.cell(dash, 1, 0, "CVD DIVERGENCE", text_color=color.white, bgcolor=color.rgb(38, 56, 77))
+    table.cell(dash, 0, 1, "CVD", text_color=muted, bgcolor=panel)
+    table.cell(dash, 1, 1, validCvd ? str.tostring(cvdClose, format.volume) : "NO DATA", text_color=cvdClose >= 0 ? bullColor : bearColor, bgcolor=panel)
+    table.cell(dash, 0, 2, "Delta / bar", text_color=muted, bgcolor=panel)
+    table.cell(dash, 1, 2, validCvd ? str.tostring(deltaBar, format.volume) : "NO DATA", text_color=deltaBar >= 0 ? bullColor : bearColor, bgcolor=panel)
+    table.cell(dash, 0, 3, "Last signal", text_color=muted, bgcolor=panel)
+    table.cell(dash, 1, 3, lastSignal, text_color=color.white, bgcolor=panel)
+    table.cell(dash, 0, 4, "Signal age", text_color=muted, bgcolor=panel)
+    table.cell(dash, 1, 4, na(lastConfirmedBar) ? "—" : str.tostring(bar_index - lastConfirmedBar) + " bars", text_color=muted, bgcolor=panel)
